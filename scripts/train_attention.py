@@ -16,19 +16,25 @@ import matplotlib.pyplot as plt
 # --- Custom Loss Functions ---
 
 class FocalTverskyLoss(nn.Module):
-    def __init__(self, delta=0.7, gamma=0.75, smooth=1e-6):
+    """
+    Focal Tversky Loss with class weights for imbalanced segmentation.
+    delta > 0.5 penalizes False Negatives more (good for small objects like cracks).
+    """
+    def __init__(self, delta=0.8, gamma=0.75, smooth=1e-6, class_weights=None):
         super(FocalTverskyLoss, self).__init__()
-        self.delta = delta
+        self.delta = delta  # Increased from 0.7 to 0.8 for small objects
         self.gamma = gamma
         self.smooth = smooth
+        # Class weights: [background, crack_path, crack_tip]
+        self.class_weights = class_weights if class_weights is not None else [1.0, 50.0, 100.0]
 
     def forward(self, logits, targets):
         # logits: (B, C, H, W)
         probs = F.softmax(logits, dim=1)
-        targets_one_hot = F.one_hot(targets, num_classes=probs.shape[1]).permute(0, 3, 1, 2).float()
+        num_classes = probs.shape[1]
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
         
         # Calculate Tversky Index for each class
-        # TP, FP, FN calculated over (B, H, W) for each channel C
         tp = (probs * targets_one_hot).sum(dim=(0, 2, 3))
         fp = (probs * (1 - targets_one_hot)).sum(dim=(0, 2, 3))
         fn = ((1 - probs) * targets_one_hot).sum(dim=(0, 2, 3))
@@ -38,43 +44,53 @@ class FocalTverskyLoss(nn.Module):
         # Focal Tversky: (1 - TI)^gamma
         focal_tversky_loss = (1 - tversky_index) ** self.gamma
         
-        return focal_tversky_loss.mean()
+        # Apply class weights
+        weights = torch.tensor(self.class_weights, device=logits.device, dtype=logits.dtype)
+        weighted_loss = focal_tversky_loss * weights
+        
+        return weighted_loss.sum() / weights.sum()
 
-class AsymmetricFocalLoss(nn.Module):
+
+class WeightedFocalCELoss(nn.Module):
     """
-    Asymmetric Focal Loss with gamma=2.0.
+    Focal Cross-Entropy Loss with proper class weighting.
+    Replaces the broken AsymmetricFocalLoss.
     """
-    def __init__(self, gamma=2.0, alpha=0.25):
-        super(AsymmetricFocalLoss, self).__init__()
+    def __init__(self, gamma=2.0, class_weights=None):
+        super(WeightedFocalCELoss, self).__init__()
         self.gamma = gamma
-        self.alpha = alpha
+        # Class weights: [background, crack_path, crack_tip]
+        self.class_weights = class_weights if class_weights is not None else [1.0, 50.0, 100.0]
 
     def forward(self, logits, targets):
-        # Cross Entropy
-        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        weight = torch.tensor(self.class_weights, device=logits.device, dtype=logits.dtype)
+        
+        # Weighted Cross Entropy
+        ce_loss = F.cross_entropy(logits, targets, weight=weight, reduction='none')
         pt = torch.exp(-ce_loss)
         
-        # Focal weights
+        # Focal modulation
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
-        if self.alpha is not None:
-             focal_loss = self.alpha * focal_loss
              
         return focal_loss.mean()
 
+
 class OptimizedHybridLoss(nn.Module):
     """
-    Combines Focal Tversky Loss and Asymmetric Focal Loss.
+    Combines Focal Tversky Loss and Weighted Focal CE Loss.
+    Both use class weights to handle crack/tip imbalance.
     """
     def __init__(self):
         super(OptimizedHybridLoss, self).__init__()
-        self.ftl = FocalTverskyLoss(delta=0.7, gamma=0.75)
-        self.afl = AsymmetricFocalLoss(gamma=2.0)
+        # Shared weights: background=1, crack_path=50, crack_tip=100
+        weights = [1.0, 50.0, 100.0]
+        self.ftl = FocalTverskyLoss(delta=0.8, gamma=0.75, class_weights=weights)
+        self.wfce = WeightedFocalCELoss(gamma=2.0, class_weights=weights)
 
     def forward(self, inputs, targets):
         loss_ftl = self.ftl(inputs, targets)
-        loss_afl = self.afl(inputs, targets)
-        return loss_ftl + loss_afl
+        loss_wfce = self.wfce(inputs, targets)
+        return loss_ftl + loss_wfce
 
 # --- Training Loop ---
 
@@ -117,8 +133,16 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
     # Optimization: Mixed Precision Scaler
     scaler = torch.amp.GradScaler('cuda')
     
+    # Scheduler: Reduce LR on Plateau
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    
     print(f"Starting training on {device} for {num_epochs} epochs...")
     print(f"Batch Size: {batch_size}, Workers: 4, AMP: Enabled")
+    
+    # Define paths early so we can save inside the loop
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    checkpoint_dir = os.path.join(PROJECT_ROOT, 'checkpoints')
+    output_dir = os.path.join(PROJECT_ROOT, 'outputs')
     
     train_losses = []
     val_losses = []
@@ -139,6 +163,11 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
                 loss = criterion(outputs, targets)
             
             scaler.scale(loss).backward()
+            
+            # Gradient Clipping to prevent explosion
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             
@@ -162,18 +191,17 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         epoch_val_loss = val_running_loss / len(val_ds)
         val_losses.append(epoch_val_loss)
         
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {epoch_val_loss:.4f}")
+        # Step Scheduler
+        scheduler.step(epoch_val_loss)
         
-    # Project Root
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    checkpoint_dir = os.path.join(PROJECT_ROOT, 'checkpoints')
-    output_dir = os.path.join(PROJECT_ROOT, 'outputs')
-    
-    # Save Best Model
-    if epoch_val_loss < best_val_loss:
-        best_val_loss = epoch_val_loss
-        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "attention_unet_best.pth"))
-        print(f"New best validation loss: {best_val_loss:.4f}. Saved model.")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, LR: {current_lr:.1e}")
+        
+        # Save Best Model (INSIDE the loop!)
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "attention_unet_best.pth"))
+            print(f"  -> New best validation loss: {best_val_loss:.4f}. Saved model.")
             
     # Save final model
     save_path = os.path.join(checkpoint_dir, "attention_unet_last.pth")

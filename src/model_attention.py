@@ -123,6 +123,7 @@ class AttentionUNet(nn.Module):
         self.down3 = Down(256, 512)
         factor = 2 if bilinear else 1
         self.down4 = Down(512, 1024 // factor)
+        self.dropout = nn.Dropout(p=0.2)
         
         # Attention Up Blocks
         self.up1 = UpAttention(1024, 1024 // factor, bilinear)
@@ -138,6 +139,8 @@ class AttentionUNet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
+        
+        x5 = self.dropout(x5)
         
         x = self.up1(x5, x4)
         x = self.up2(x, x3)

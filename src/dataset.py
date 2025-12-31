@@ -47,6 +47,6 @@ class CrackDataset(Dataset):
         y = self.targets[idx]
 
         if self.transform:
-            pass
+            x = self.transform(x)
             
         return x, y
