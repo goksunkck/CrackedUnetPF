@@ -226,7 +226,7 @@ def main():
     
     if not os.path.exists(output_dir): os.makedirs(output_dir)
 
-    model_path = os.path.join(PROJECT_ROOT, "checkpoints", "attention_unet_best.pth")
+    model_path = os.path.join(PROJECT_ROOT, "checkpoints", "attention_unet_best_flip_1.pth")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Load Model Once

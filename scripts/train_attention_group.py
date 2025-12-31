@@ -1,8 +1,12 @@
+"""
+Training script for AttentionUNet with GroupNorm.
+Uses GroupNorm instead of BatchNorm for better domain shift handling.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import os
 import sys
 
@@ -10,41 +14,31 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.dataset import CrackDataset
-from src.model_attention import AttentionUNet
+from src.model_attention_group import AttentionUNetGN  # GroupNorm model
 import matplotlib.pyplot as plt
 
 # --- Custom Loss Functions ---
 
 class FocalTverskyLoss(nn.Module):
-    """
-    Focal Tversky Loss with class weights for imbalanced segmentation.
-    delta > 0.5 penalizes False Negatives more (good for small objects like cracks).
-    """
     def __init__(self, delta=0.8, gamma=0.75, smooth=1e-6, class_weights=None):
         super(FocalTverskyLoss, self).__init__()
-        self.delta = delta  # Increased from 0.7 to 0.8 for small objects
+        self.delta = delta
         self.gamma = gamma
         self.smooth = smooth
-        # Class weights: [background, crack_path, crack_tip]
-        self.class_weights = class_weights if class_weights is not None else [1.0, 50.0, 100.0]
+        self.class_weights = class_weights if class_weights is not None else [1.0, 10.0, 20.0]
 
     def forward(self, logits, targets):
-        # logits: (B, C, H, W)
         probs = F.softmax(logits, dim=1)
         num_classes = probs.shape[1]
         targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
         
-        # Calculate Tversky Index for each class
         tp = (probs * targets_one_hot).sum(dim=(0, 2, 3))
         fp = (probs * (1 - targets_one_hot)).sum(dim=(0, 2, 3))
         fn = ((1 - probs) * targets_one_hot).sum(dim=(0, 2, 3))
         
         tversky_index = (tp + self.smooth) / (tp + self.delta * fn + (1 - self.delta) * fp + self.smooth)
-        
-        # Focal Tversky: (1 - TI)^gamma
         focal_tversky_loss = (1 - tversky_index) ** self.gamma
         
-        # Apply class weights
         weights = torch.tensor(self.class_weights, device=logits.device, dtype=logits.dtype)
         weighted_loss = focal_tversky_loss * weights
         
@@ -52,94 +46,42 @@ class FocalTverskyLoss(nn.Module):
 
 
 class WeightedFocalCELoss(nn.Module):
-    """
-    Focal Cross-Entropy Loss with proper class weighting.
-    Replaces the broken AsymmetricFocalLoss.
-    """
     def __init__(self, gamma=2.0, class_weights=None):
         super(WeightedFocalCELoss, self).__init__()
         self.gamma = gamma
-        # Class weights: [background, crack_path, crack_tip]
-        self.class_weights = class_weights if class_weights is not None else [1.0, 50.0, 100.0]
+        self.class_weights = class_weights if class_weights is not None else [1.0, 10.0, 20.0]
 
     def forward(self, logits, targets):
         weight = torch.tensor(self.class_weights, device=logits.device, dtype=logits.dtype)
-        
-        # Weighted Cross Entropy
         ce_loss = F.cross_entropy(logits, targets, weight=weight, reduction='none')
         pt = torch.exp(-ce_loss)
-        
-        # Focal modulation
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-             
         return focal_loss.mean()
 
 
-class TipMSELoss(nn.Module):
-    """
-    MSE Loss on crack tip centroid coordinates.
-    Directly optimizes for tip localization accuracy.
-    """
-    def __init__(self, tip_class=2, weight=0.001):
-        super(TipMSELoss, self).__init__()
-        self.tip_class = tip_class
-        self.weight = weight
-    
-    def forward(self, logits, targets):
-        # logits: (B, C, H, W), targets: (B, H, W)
-        B, _, H, W = logits.shape
-        pred_mask = torch.argmax(logits, dim=1)  # (B, H, W)
-        
-        total_loss = 0.0
-        valid_count = 0
-        
-        for b in range(B):
-            pred_tip_mask = (pred_mask[b] == self.tip_class)
-            gt_tip_mask = (targets[b] == self.tip_class)
-            
-            # Only compute if BOTH have tip pixels
-            if pred_tip_mask.any() and gt_tip_mask.any():
-                pred_coords = pred_tip_mask.nonzero(as_tuple=False).float()
-                pred_centroid = pred_coords.mean(dim=0)
-                
-                gt_coords = gt_tip_mask.nonzero(as_tuple=False).float()
-                gt_centroid = gt_coords.mean(dim=0)
-                
-                # Normalized MSE (divide by image dimension to keep loss small)
-                mse = ((pred_centroid - gt_centroid) ** 2).sum() / (H * W)
-                total_loss += mse
-                valid_count += 1
-            # No penalty for missing tip - let segmentation loss handle it
-        
-        if valid_count > 0:
-            return self.weight * (total_loss / valid_count)
-        else:
-            return torch.tensor(0.0, device=logits.device, requires_grad=False)
-
-
 class OptimizedHybridLoss(nn.Module):
-    """
-    Combines Focal Tversky Loss + Weighted Focal CE Loss + Tip MSE Loss.
-    """
+    """Combines Focal Tversky Loss + Weighted Focal CE Loss."""
     def __init__(self):
         super(OptimizedHybridLoss, self).__init__()
-        # Conservative weights: background=1, crack_path=10, crack_tip=20
         weights = [1.0, 10.0, 20.0]
         self.ftl = FocalTverskyLoss(delta=0.8, gamma=0.75, class_weights=weights)
         self.wfce = WeightedFocalCELoss(gamma=2.0, class_weights=weights)
-        self.tip_mse = TipMSELoss(tip_class=2, weight=0.01)  # Small weight to not dominate
 
     def forward(self, inputs, targets):
         loss_ftl = self.ftl(inputs, targets)
         loss_wfce = self.wfce(inputs, targets)
-        loss_tip = self.tip_mse(inputs, targets)
-        return loss_ftl + loss_wfce + loss_tip
+        return loss_ftl + loss_wfce
+
 
 # --- Training Loop ---
 
-def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate=1e-3, device='cuda'):
+def train_groupnorm_model(data_dir, num_epochs=100, batch_size=16, learning_rate=1e-3, device='cuda'):
+    print("=" * 60)
+    print("Training AttentionUNet with GroupNorm")
+    print("=" * 60)
+    
     # Paths
-    print("Initializing dataset for Attention U-Net...")
+    print("Initializing dataset...")
     input_paths = [
         os.path.join(data_dir, "lInputData_left.pt"),
         os.path.join(data_dir, "lInputData_right.pt")
@@ -149,7 +91,7 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         os.path.join(data_dir, "lGroundTruthData_right.pt")
     ]
     
-    # Simple augmentation: random vertical flip only (keeps 256x256)
+    # Simple augmentation: random vertical flip only
     print("Using simple augmentation (random vertical flip only)...")
     
     class SimpleFlipAugmentation:
@@ -158,8 +100,8 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         
         def __call__(self, x, y):
             if torch.rand(1).item() < self.p:
-                x = torch.flip(x, dims=[1])  # Flip vertically (H dimension)
-                y = torch.flip(y, dims=[0])  # Flip vertically
+                x = torch.flip(x, dims=[1])
+                y = torch.flip(y, dims=[0])
             return x, y
     
     train_transform = SimpleFlipAugmentation(p=0.5)
@@ -171,15 +113,14 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
     val_size = int(0.2 * len(full_dataset))
     train_size = len(full_dataset) - val_size
     
-    # Create index lists for train/val
     indices = list(range(len(full_dataset)))
     import random
-    random.seed(42)  # Reproducible split
+    random.seed(42)
     random.shuffle(indices)
     train_indices = indices[:train_size]
     val_indices = indices[train_size:]
     
-    # Create wrapper datasets with transforms
+    # Wrapper dataset with transforms
     class TransformSubset(torch.utils.data.Dataset):
         def __init__(self, dataset, indices, transform):
             self.dataset = dataset
@@ -196,42 +137,37 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
             return x, y
     
     train_ds = TransformSubset(full_dataset, train_indices, train_transform)
-    
-    # Validation: No augmentation - use simple Subset
     val_ds = torch.utils.data.Subset(full_dataset, val_indices)
     
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     
-    # Optimizations: num_workers, pin_memory
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
                               num_workers=4, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
                             num_workers=4, pin_memory=True, persistent_workers=True)
     
-    # Model: Attention U-Net
-    print("Building Attention U-Net...")
-    model = AttentionUNet(n_channels=2, n_classes=3).to(device)
+    # Model: Attention U-Net with GroupNorm
+    print("Building AttentionUNet with GroupNorm...")
+    model = AttentionUNetGN(n_channels=2, n_classes=3).to(device)
     
-    # Loss: Optimized Hybrid (Focal Tversky + Asymmetric Focal)
-    print("Using Optimized Hybrid Loss (Focal Tversky + Asymmetric Focal)...")
+    # Loss
+    print("Using Optimized Hybrid Loss (Focal Tversky + Focal CE)...")
     criterion = OptimizedHybridLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
     
-    # Optimization: Mixed Precision Scaler
+    # Mixed Precision
     scaler = torch.amp.GradScaler('cuda')
     
-    # Scheduler: Reduce LR on Plateau
+    # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     print(f"Starting training on {device} for {num_epochs} epochs...")
     print(f"Batch Size: {batch_size}, Workers: 4, AMP: Enabled")
     
-    # Define paths early so we can save inside the loop
+    # Paths
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     checkpoint_dir = os.path.join(PROJECT_ROOT, 'checkpoints')
     output_dir = os.path.join(PROJECT_ROOT, 'outputs')
-    
-    # Create directories if they don't exist (for Colab compatibility)
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
     
@@ -248,17 +184,13 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
             
             optimizer.zero_grad()
             
-            # Optimization: Mixed Precision Training
             with torch.amp.autocast('cuda'):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
             
             scaler.scale(loss).backward()
-            
-            # Gradient Clipping to prevent explosion
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             scaler.step(optimizer)
             scaler.update()
             
@@ -267,13 +199,12 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         epoch_loss = running_loss / len(train_ds)
         train_losses.append(epoch_loss)
         
-        # QA / Validation
+        # Validation
         model.eval()
         val_running_loss = 0.0
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-                # AMP for validation too (saves memory/time)
                 with torch.amp.autocast('cuda'):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
@@ -282,20 +213,19 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         epoch_val_loss = val_running_loss / len(val_ds)
         val_losses.append(epoch_val_loss)
         
-        # Step Scheduler
         scheduler.step(epoch_val_loss)
         
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {epoch_val_loss:.4f}, LR: {current_lr:.1e}")
         
-        # Save Best Model (INSIDE the loop!)
+        # Save Best Model
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "attention_unet_best.pth"))
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, "attention_unet_groupnorm_best.pth"))
             print(f"  -> New best validation loss: {best_val_loss:.4f}. Saved model.")
             
     # Save final model
-    save_path = os.path.join(checkpoint_dir, "attention_unet_last.pth")
+    save_path = os.path.join(checkpoint_dir, "attention_unet_groupnorm_last.pth")
     torch.save(model.state_dict(), save_path)
     print(f"Final model saved to {save_path}")
     
@@ -304,12 +234,12 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Val Loss')
     plt.legend()
-    plt.title("Training Curves (Attention U-Net + Hybrid Loss)")
-    plt.savefig(os.path.join(output_dir, "attention_training_loss.png"))
-    print("Saved attention_training_loss.png")
+    plt.title("Training Curves (AttentionUNet + GroupNorm)")
+    plt.savefig(os.path.join(output_dir, "groupnorm_training_loss.png"))
+    print("Saved groupnorm_training_loss.png")
 
 if __name__ == "__main__":
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     data_dir = os.path.join(PROJECT_ROOT, "data", "S_160_4.7", "interim")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    train_attention_model(data_dir, device=device)
+    train_groupnorm_model(data_dir, device=device)

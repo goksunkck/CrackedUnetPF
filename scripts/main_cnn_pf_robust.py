@@ -181,7 +181,7 @@ def run_robust_tracking(dataset, dataset_name, model, device, output_dir):
 
 if __name__ == "__main__":
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    model_path = os.path.join(PROJECT_ROOT, 'checkpoints', "attention_unet_best.pth")
+    model_path = os.path.join(PROJECT_ROOT, 'checkpoints', "attention_unet_best_mse.pth")
     output_dir = os.path.join(PROJECT_ROOT, 'outputs')
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

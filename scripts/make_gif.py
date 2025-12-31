@@ -9,7 +9,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 # Add project root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.model_attention import AttentionUNet
+from src.model_attention_group import AttentionUNetGN
 from src.utils.inference import extract_tip_coordinates, load_model as base_load_model
 
 def make_gif(model, data_dir, dataset_name, device='cuda', output_path='outputs/video.gif'):
@@ -21,8 +21,6 @@ def make_gif(model, data_dir, dataset_name, device='cuda', output_path='outputs/
         return
 
     inputs_list = torch.load(input_path)
-    # Limit to e.g., first 100 frames or skip frames if too long?
-    # S_950 is 204 frames. We can do all of them.
     N = len(inputs_list)
     print(f"Dataset size: {N} frames")
     
@@ -85,7 +83,7 @@ if __name__ == "__main__":
     dataset_name = args.experiment
 
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    model_path = os.path.join(PROJECT_ROOT, 'checkpoints', "attention_unet_best.pth")
+    model_path = os.path.join(PROJECT_ROOT, 'checkpoints', "attention_unet_groupnorm_best.pth")
     data_dir = os.path.join(PROJECT_ROOT, "data", dataset_name, "interim")
     output_dir = os.path.join(PROJECT_ROOT, 'outputs')
     
@@ -99,7 +97,7 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     print(f"Loading model from {model_path}...")
-    model = AttentionUNet(n_channels=2, n_classes=3).to(device)
+    model = AttentionUNetGN(n_channels=2, n_classes=3).to(device)
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
     else:
