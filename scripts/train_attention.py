@@ -95,6 +95,9 @@ class OptimizedHybridLoss(nn.Module):
 # --- Training Loop ---
 
 def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate=1e-3, device='cuda'):
+    # Import augmentation transforms
+    from src.augmentation import PaperAugmentation, ValidationTransform
+    
     # Paths
     print("Initializing dataset for Attention U-Net...")
     input_paths = [
@@ -106,16 +109,51 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
         os.path.join(data_dir, "lGroundTruthData_right.pt")
     ]
     
-    # Dataset
-    dataset = CrackDataset(input_paths, gt_paths)
+    # Create datasets WITH proper transforms (as per paper)
+    # Training: Full augmentation (crop, rotate, flip, resize to 224)
+    # Validation: No augmentation, just resize to 224
+    print("Using paper-specified data augmentation (crop, rotate, flip, resize to 224x224)...")
     
-    # Split
-    val_size = int(0.2 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_transform = PaperAugmentation(output_size=224)
+    val_transform = ValidationTransform()  # No resize, keep original 256x256
+    
+    # Load data into separate datasets for train/val
+    full_dataset = CrackDataset(input_paths, gt_paths, transform=None)
+    
+    # Split indices
+    val_size = int(0.2 * len(full_dataset))
+    train_size = len(full_dataset) - val_size
+    
+    # Create index lists for train/val
+    indices = list(range(len(full_dataset)))
+    import random
+    random.seed(42)  # Reproducible split
+    random.shuffle(indices)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    
+    # Create wrapper datasets with transforms
+    class TransformSubset(torch.utils.data.Dataset):
+        def __init__(self, dataset, indices, transform):
+            self.dataset = dataset
+            self.indices = indices
+            self.transform = transform
+        
+        def __len__(self):
+            return len(self.indices)
+        
+        def __getitem__(self, idx):
+            x, y = self.dataset.inputs[self.indices[idx]], self.dataset.targets[self.indices[idx]]
+            if self.transform and y is not None:
+                x, y = self.transform(x, y)
+            return x, y
+    
+    train_ds = TransformSubset(full_dataset, train_indices, train_transform)
+    val_ds = TransformSubset(full_dataset, val_indices, val_transform)
+    
+    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     
     # Optimizations: num_workers, pin_memory
-    # persistent_workers=True helps if you have enough RAM
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
                               num_workers=4, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
@@ -143,6 +181,10 @@ def train_attention_model(data_dir, num_epochs=100, batch_size=16, learning_rate
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     checkpoint_dir = os.path.join(PROJECT_ROOT, 'checkpoints')
     output_dir = os.path.join(PROJECT_ROOT, 'outputs')
+    
+    # Create directories if they don't exist (for Colab compatibility)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     train_losses = []
     val_losses = []

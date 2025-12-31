@@ -46,7 +46,8 @@ class CrackDataset(Dataset):
         x = self.inputs[idx]
         y = self.targets[idx]
 
-        if self.transform:
-            x = self.transform(x)
+        # Apply transform to BOTH input and target (for segmentation)
+        if self.transform and y is not None:
+            x, y = self.transform(x, y)
             
         return x, y
