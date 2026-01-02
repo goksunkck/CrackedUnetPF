@@ -1,5 +1,5 @@
 """
-
+    Interpolation of the raw nodemaps data, code is based on Metching et al. (2022) with some parallelization for speed.
     Prepare the data for training.
 
     Input: Raw Nodemaps data (expected in sub folder 'Nodemaps' of NODEMAP_PATH)
