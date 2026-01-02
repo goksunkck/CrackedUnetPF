@@ -58,8 +58,13 @@ Before running the tracker, raw data (Nodemaps) must be processed into PyTorch t
 python make_data.py --experiment S_160_4.7
 ```
 *Available experiments: `S_160_4.7`, `S_160_2.0`, `S_950_1.6`*
+### 2. Training the Attention U-Net
 
-### 2. Running the Tracker
+```bash
+python scripts/train_attention.py 
+```
+
+### 3. Running the Tracker
 To run the full crack tracking pipeline (CNN detection + Particle Filter estimation):
 
 ```bash
@@ -82,7 +87,7 @@ A Sequential Importance Resampling (SIR) Particle Filter is used for state estim
   - $a$: Crack length
   - $C, m$: Paris Law constants
 - **Transition Model**: Based on Paris Law:
-  $$ \frac{da}{dN} = C (\Delta K)^m $$
+  $da/dN = C (\Delta K)^m$
 - **Observation Model**: Likelihood is computed based on the Euclidean distance between the Particle predictions and the CNN measured crack tip.
 
 ## Reference
