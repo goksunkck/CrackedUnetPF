@@ -83,7 +83,7 @@ def run_tracking(dataset, dataset_name, model, device, output_dir):
     DATASET_NOISE_PARAMS = {
         "S_160_4.7": 0.5,
         "S_160_2.0": 2.0,
-        "S_950_1.6": 15.0 
+        "S_950_1.6": 5.0 
     }
     meas_R = DATASET_NOISE_PARAMS.get(dataset_name, 3.0)
     print(f"Using Measurement Noise Sigma (R) = {meas_R:.2f} mm")
@@ -226,7 +226,7 @@ def main():
     
     if not os.path.exists(output_dir): os.makedirs(output_dir)
 
-    model_path = os.path.join(PROJECT_ROOT, "checkpoints", "attention_unet_best_flip_1.pth")
+    model_path = os.path.join(PROJECT_ROOT, "checkpoints", "attention_unet_best.pth")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # Load Model Once
